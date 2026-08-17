@@ -1,9 +1,10 @@
 from pathlib import Path
+import os
 
 import yaml
 
 
-POLICY_FILE = Path("hardening-policy.yml")
+POLICY_FILE = Path(os.environ.get("CONTAINER_SECURITY_POLICY", "hardening-policy.yml"))
 DOCKERFILE = Path("app/Dockerfile")
 REQUIREMENTS_FILE = Path("app/requirements.txt")
 COMPOSE_FILE = Path("docker-compose.yml")

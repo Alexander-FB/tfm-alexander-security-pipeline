@@ -1,5 +1,6 @@
 from collections import Counter
 from pathlib import Path
+import os
 import json
 import re
 
@@ -7,7 +8,7 @@ import yaml
 
 
 RESULTS_DIR = Path("results")
-POLICY_FILE = Path("hardening-policy.yml")
+POLICY_FILE = Path(os.environ.get("CONTAINER_SECURITY_POLICY", "hardening-policy.yml"))
 
 BASELINE = "baseline"
 HARDENED = "hardened"
