@@ -5,6 +5,7 @@ on:
 
 permissions:
   contents: write
+  statuses: write
 
 jobs:
   container-security:
@@ -74,6 +75,7 @@ jobs:
           retention-days: 14
 
       - name: Commit automated hardening
+        id: hardening_commit
         if: >-
           ${{
             success() &&
@@ -89,6 +91,10 @@ jobs:
 
           if git diff --cached --quiet; then
             echo "No hardening changes to commit."
+
+            echo "created=false" >> "$GITHUB_OUTPUT"
+            echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
             exit 0
           fi
 
@@ -104,3 +110,27 @@ jobs:
             -m "chore(security): apply automated container hardening"
 
           git push
+
+          echo "created=true" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Publish hardened commit gate status
+        if: >-
+          ${{
+            success() &&
+            steps.hardening_commit.outputs.created == 'true'
+          }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HARDENED_SHA: ${{ steps.hardening_commit.outputs.sha }}
+        run: |
+          gh api \
+            --method POST \
+            "repos/${GITHUB_REPOSITORY}/statuses/${HARDENED_SHA}" \
+            -f state=success \
+            -f context="container-security/gate" \
+            -f description="Automated hardening validated successfully" \
+            -f target_url="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          echo "Published SUCCESS status for ${HARDENED_SHA}"
