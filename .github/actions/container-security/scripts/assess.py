@@ -3,33 +3,74 @@ import os
 
 import yaml
 
-from report import analyse_variant, evaluate_gate
+from report import (
+    analyse_variant,
+    evaluate_gate,
+)
 
 
 POLICY_FILE = Path(
     os.environ.get(
         "CONTAINER_SECURITY_POLICY",
-        "hardening-policy.yml",
+        "container-security-policy.yml",
     )
 )
+
+COMPOSE_FILE = Path(
+    "docker-compose.yml"
+)
+
+
+def read_nginx_image():
+    compose = yaml.safe_load(
+        COMPOSE_FILE.read_text(
+            encoding="utf-8"
+        )
+    )
+
+    return (
+        compose
+        .get("services", {})
+        .get("nginx", {})
+        .get("image")
+    )
 
 
 def main():
     policy = yaml.safe_load(
-        POLICY_FILE.read_text()
+        POLICY_FILE.read_text(
+            encoding="utf-8"
+        )
     )
 
     baseline = analyse_variant(
         "baseline"
     )
 
-    result = evaluate_gate(
+    gate_result = evaluate_gate(
         baseline,
         policy,
     )
 
+    approved_nginx = (
+        policy
+        .get("images", {})
+        .get("nginx")
+    )
+
+    current_nginx = (
+        read_nginx_image()
+    )
+
+    nginx_compliant = (
+        approved_nginx is not None
+        and current_nginx
+        == approved_nginx
+    )
+
     remediation_required = (
-        not result["passed"]
+        not gate_result["passed"]
+        or not nginx_compliant
     )
 
     value = (
@@ -39,16 +80,31 @@ def main():
     )
 
     print()
-    print("BASELINE COMPLIANCE")
-    print("-------------------")
     print(
-        "Compliant ................. "
+        "BASELINE COMPLIANCE"
+    )
+    print(
+        "-------------------"
+    )
+
+    print(
+        "Security controls ......... "
         + (
-            "No"
-            if remediation_required
-            else "Yes"
+            "PASS"
+            if gate_result["passed"]
+            else "FAIL"
         )
     )
+
+    print(
+        "Nginx image ............... "
+        + (
+            "PASS"
+            if nginx_compliant
+            else "FAIL"
+        )
+    )
+
     print(
         "Remediation required ...... "
         + (
@@ -57,19 +113,43 @@ def main():
             else "No"
         )
     )
+
     print()
 
-    if remediation_required:
-        print("Blocking controls:")
-        for check in result["failures"]:
+    if not gate_result["passed"]:
+        print(
+            "Blocking security controls:"
+        )
+
+        for check in gate_result[
+            "failures"
+        ]:
             print(
                 f"  - {check['name']}: "
                 f"{check['detail']}"
             )
-    else:
+
+    if not nginx_compliant:
+        print()
+        print(
+            "Nginx image policy:"
+        )
+
+        print(
+            f"  Current:  "
+            f"{current_nginx}"
+        )
+
+        print(
+            f"  Approved: "
+            f"{approved_nginx}"
+        )
+
+    if not remediation_required:
+        print()
         print(
             "Baseline already satisfies "
-            "the configured security policy."
+            "the central security policy."
         )
 
     github_output = os.environ.get(

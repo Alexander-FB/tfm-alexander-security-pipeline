@@ -40,10 +40,6 @@ runs:
           --disable-pip-version-check \
           -r "$GITHUB_ACTION_PATH/requirements.txt"
 
-    # ================================================================
-    # SCANNER SETUP
-    # ================================================================
-
     - name: Install Syft
       if: ${{ inputs.phase == 'baseline' || inputs.phase == 'hardened' }}
       id: syft
@@ -64,9 +60,10 @@ runs:
         version: v0.72.0
         cache: true
 
-    # ================================================================
+
+    # =============================================================
     # BASELINE
-    # ================================================================
+    # =============================================================
 
     - name: Prepare baseline evidence
       if: ${{ inputs.phase == 'baseline' }}
@@ -75,7 +72,7 @@ runs:
         rm -rf results/baseline
         mkdir -p results/baseline
 
-    - name: Build baseline image
+    - name: Build baseline API image
       if: ${{ inputs.phase == 'baseline' }}
       shell: bash
       run: |
@@ -95,15 +92,15 @@ runs:
           -t tfm-api:baseline \
           -t "$compose_image" \
           ./app
-          
-    - name: Generate baseline SBOM
+
+    - name: Generate baseline API SBOM
       if: ${{ inputs.phase == 'baseline' }}
       shell: bash
       run: |
         syft tfm-api:baseline \
           -o spdx-json=results/baseline/sbom.spdx.json
 
-    - name: Scan baseline vulnerabilities
+    - name: Scan baseline API vulnerabilities
       if: ${{ inputs.phase == 'baseline' }}
       shell: bash
       run: |
@@ -112,6 +109,63 @@ runs:
           --format json \
           --output results/baseline/trivy-image.json \
           tfm-api:baseline
+
+    - name: Resolve baseline Nginx image
+      if: ${{ inputs.phase == 'baseline' }}
+      id: baseline_nginx
+      shell: bash
+      run: |
+        nginx_image="$(
+          docker compose config --format json \
+            | jq -r '.services.nginx.image'
+        )"
+
+        if [ -z "$nginx_image" ] || [ "$nginx_image" = "null" ]; then
+          echo "Unable to determine Nginx image from Docker Compose."
+          exit 1
+        fi
+
+        echo "Baseline Nginx image: $nginx_image"
+
+        printf '%s\n' \
+          "$nginx_image" \
+          > results/baseline/nginx-image.txt
+
+        echo "image=$nginx_image" >> "$GITHUB_OUTPUT"
+
+    - name: Pull baseline Nginx image
+      if: ${{ inputs.phase == 'baseline' }}
+      shell: bash
+      run: |
+        docker pull \
+          "${{ steps.baseline_nginx.outputs.image }}"
+
+    - name: Generate baseline Nginx SBOM
+      if: ${{ inputs.phase == 'baseline' }}
+      shell: bash
+      run: |
+        syft \
+          "${{ steps.baseline_nginx.outputs.image }}" \
+          -o spdx-json=results/baseline/nginx-sbom.spdx.json
+
+    - name: Scan baseline Nginx vulnerabilities
+      if: ${{ inputs.phase == 'baseline' }}
+      shell: bash
+      run: |
+        trivy image \
+          --scanners vuln \
+          --format json \
+          --output results/baseline/nginx-trivy-image.json \
+          "${{ steps.baseline_nginx.outputs.image }}"
+
+    - name: Record baseline Nginx digest
+      if: ${{ inputs.phase == 'baseline' }}
+      shell: bash
+      run: |
+        docker image inspect \
+          "${{ steps.baseline_nginx.outputs.image }}" \
+          --format '{{join .RepoDigests "\n"}}' \
+          > results/baseline/nginx-digest.txt
 
     - name: Scan baseline configuration
       if: ${{ inputs.phase == 'baseline' }}
@@ -139,9 +193,11 @@ runs:
         set -e
 
         if [ "$exit_code" -eq 0 ]; then
-          echo "DCLINT_RESULT=PASS" >> results/baseline/dclint.txt
+          echo "DCLINT_RESULT=PASS" \
+            >> results/baseline/dclint.txt
         else
-          echo "DCLINT_RESULT=FAIL" >> results/baseline/dclint.txt
+          echo "DCLINT_RESULT=FAIL" \
+            >> results/baseline/dclint.txt
         fi
 
         echo "DCLint baseline exit code: $exit_code"
@@ -158,18 +214,29 @@ runs:
           -d \
           --no-build
 
+        ready=false
+
         for attempt in $(seq 1 30); do
           if curl \
             --silent \
             --fail \
             http://localhost:8080/health \
-            > /dev/null; then
+            > /dev/null
+          then
             echo "Baseline application ready."
+            ready=true
             break
           fi
 
           sleep 2
         done
+
+        if [ "$ready" != "true" ]; then
+          echo "Baseline application did not become healthy."
+          docker compose ps
+          docker compose logs
+          exit 1
+        fi
 
     - name: Validate baseline runtime
       if: ${{ inputs.phase == 'baseline' }}
@@ -197,11 +264,12 @@ runs:
         python \
           "$GITHUB_ACTION_PATH/scripts/assess.py"
 
-    # ================================================================
-    # REMEDIATION
-    # ================================================================
 
-    - name: Apply central security policy
+    # =============================================================
+    # REMEDIATION
+    # =============================================================
+
+    - name: Apply container hardening policy
       if: ${{ inputs.phase == 'remediate' }}
       shell: bash
       env:
@@ -210,9 +278,19 @@ runs:
         python \
           "$GITHUB_ACTION_PATH/scripts/remediate.py"
 
-    # ================================================================
+    - name: Apply Nginx image policy
+      if: ${{ inputs.phase == 'remediate' }}
+      shell: bash
+      env:
+        CONTAINER_SECURITY_POLICY: ${{ github.action_path }}/policy/container-security-policy.yml
+      run: |
+        python \
+          "$GITHUB_ACTION_PATH/scripts/remediate_nginx.py"
+
+
+    # =============================================================
     # HARDENED
-    # ================================================================
+    # =============================================================
 
     - name: Prepare hardened evidence
       if: ${{ inputs.phase == 'hardened' }}
@@ -221,22 +299,35 @@ runs:
         rm -rf results/hardened
         mkdir -p results/hardened
 
-    - name: Build hardened image
+    - name: Build hardened API image
       if: ${{ inputs.phase == 'hardened' }}
       shell: bash
       run: |
+        compose_image="$(
+          docker compose config --format json \
+            | jq -r '.services.api.image'
+        )"
+
+        if [ -z "$compose_image" ] || [ "$compose_image" = "null" ]; then
+          echo "Unable to determine API image from Docker Compose."
+          exit 1
+        fi
+
+        echo "Compose expects API image: $compose_image"
+
         docker build \
           -t tfm-api:hardened \
+          -t "$compose_image" \
           ./app
 
-    - name: Generate hardened SBOM
+    - name: Generate hardened API SBOM
       if: ${{ inputs.phase == 'hardened' }}
       shell: bash
       run: |
         syft tfm-api:hardened \
           -o spdx-json=results/hardened/sbom.spdx.json
 
-    - name: Scan hardened vulnerabilities
+    - name: Scan hardened API vulnerabilities
       if: ${{ inputs.phase == 'hardened' }}
       shell: bash
       run: |
@@ -245,6 +336,63 @@ runs:
           --format json \
           --output results/hardened/trivy-image.json \
           tfm-api:hardened
+
+    - name: Resolve hardened Nginx image
+      if: ${{ inputs.phase == 'hardened' }}
+      id: hardened_nginx
+      shell: bash
+      run: |
+        nginx_image="$(
+          docker compose config --format json \
+            | jq -r '.services.nginx.image'
+        )"
+
+        if [ -z "$nginx_image" ] || [ "$nginx_image" = "null" ]; then
+          echo "Unable to determine Nginx image from Docker Compose."
+          exit 1
+        fi
+
+        echo "Hardened Nginx image: $nginx_image"
+
+        printf '%s\n' \
+          "$nginx_image" \
+          > results/hardened/nginx-image.txt
+
+        echo "image=$nginx_image" >> "$GITHUB_OUTPUT"
+
+    - name: Pull hardened Nginx image
+      if: ${{ inputs.phase == 'hardened' }}
+      shell: bash
+      run: |
+        docker pull \
+          "${{ steps.hardened_nginx.outputs.image }}"
+
+    - name: Generate hardened Nginx SBOM
+      if: ${{ inputs.phase == 'hardened' }}
+      shell: bash
+      run: |
+        syft \
+          "${{ steps.hardened_nginx.outputs.image }}" \
+          -o spdx-json=results/hardened/nginx-sbom.spdx.json
+
+    - name: Scan hardened Nginx vulnerabilities
+      if: ${{ inputs.phase == 'hardened' }}
+      shell: bash
+      run: |
+        trivy image \
+          --scanners vuln \
+          --format json \
+          --output results/hardened/nginx-trivy-image.json \
+          "${{ steps.hardened_nginx.outputs.image }}"
+
+    - name: Record hardened Nginx digest
+      if: ${{ inputs.phase == 'hardened' }}
+      shell: bash
+      run: |
+        docker image inspect \
+          "${{ steps.hardened_nginx.outputs.image }}" \
+          --format '{{join .RepoDigests "\n"}}' \
+          > results/hardened/nginx-digest.txt
 
     - name: Scan hardened configuration
       if: ${{ inputs.phase == 'hardened' }}
@@ -272,12 +420,14 @@ runs:
         set -e
 
         if [ "$exit_code" -eq 0 ]; then
-          echo "DCLINT_RESULT=PASS" >> results/hardened/dclint.txt
+          echo "DCLINT_RESULT=PASS" \
+            >> results/hardened/dclint.txt
         else
-          echo "DCLINT_RESULT=FAIL" >> results/hardened/dclint.txt
+          echo "DCLINT_RESULT=FAIL" \
+            >> results/hardened/dclint.txt
         fi
 
-        echo "DCLint hardened exit code: $exit_code"Build baseline image
+        echo "DCLint hardened exit code: $exit_code"
 
     - name: Start hardened environment
       if: ${{ inputs.phase == 'hardened' }}
@@ -287,20 +437,33 @@ runs:
           -v \
           --remove-orphans || true
 
-        docker compose up -d
+        docker compose up \
+          -d \
+          --no-build
+
+        ready=false
 
         for attempt in $(seq 1 30); do
           if curl \
             --silent \
             --fail \
             http://localhost:8080/health \
-            > /dev/null; then
+            > /dev/null
+          then
             echo "Hardened application ready."
+            ready=true
             break
           fi
 
           sleep 2
         done
+
+        if [ "$ready" != "true" ]; then
+          echo "Hardened application did not become healthy."
+          docker compose ps
+          docker compose logs
+          exit 1
+        fi
 
     - name: Validate hardened runtime
       if: ${{ inputs.phase == 'hardened' }}
@@ -318,9 +481,10 @@ runs:
           -v \
           --remove-orphans || true
 
-    # ================================================================
-    # REPORT + GATE
-    # ================================================================
+
+    # =============================================================
+    # REPORT / GATE
+    # =============================================================
 
     - name: Generate comparison and evaluate policy
       if: ${{ inputs.phase == 'report' }}
