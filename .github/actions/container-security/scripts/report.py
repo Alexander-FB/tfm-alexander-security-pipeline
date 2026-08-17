@@ -1,22 +1,25 @@
 from collections import Counter
 from pathlib import Path
-import os
 import json
+import os
 import re
 
 import yaml
 
 
 RESULTS_DIR = Path("results")
-POLICY_FILE = Path(os.environ.get("CONTAINER_SECURITY_POLICY", "hardening-policy.yml"))
+
+POLICY_FILE = Path(
+    os.environ.get(
+        "CONTAINER_SECURITY_POLICY",
+        "container-security-policy.yml",
+    )
+)
 
 BASELINE = "baseline"
 HARDENED = "hardened"
 
-SEVERITIES = (
-    "UNKNOWN",
-    "LOW",
-    "MEDIUM",
+BLOCKING_SEVERITIES = (
     "HIGH",
     "CRITICAL",
 )
@@ -36,9 +39,9 @@ def counter_value(counter, severity):
 
 
 def high_critical(counter):
-    return (
-        counter_value(counter, "HIGH")
-        + counter_value(counter, "CRITICAL")
+    return sum(
+        counter_value(counter, severity)
+        for severity in BLOCKING_SEVERITIES
     )
 
 
@@ -57,26 +60,24 @@ def pass_fail(value):
 
 
 def delta(before, after):
-    difference = after - before
+    value = after - before
 
-    if difference > 0:
-        return f"+{difference}"
+    if value > 0:
+        return f"+{value}"
 
-    return str(difference)
+    return str(value)
 
 
 # ---------------------------------------------------------------------
-# SBOM
+# SBOM — Syft
 # ---------------------------------------------------------------------
 
 def parse_sbom(variant):
-    path = (
+    data = read_json(
         RESULTS_DIR
         / variant
         / "sbom.spdx.json"
     )
-
-    data = read_json(path)
 
     return {
         "package_entries": len(
@@ -86,26 +87,28 @@ def parse_sbom(variant):
 
 
 # ---------------------------------------------------------------------
-# Trivy vulnerability results
+# Vulnerabilities — Trivy Image
 # ---------------------------------------------------------------------
 
 def parse_vulnerabilities(variant):
-    path = (
+    data = read_json(
         RESULTS_DIR
         / variant
         / "trivy-image.json"
     )
 
-    data = read_json(path)
-
     result = {
         "os": {
             "total": Counter(),
             "fixable": Counter(),
+            "no_fix_reported": Counter(),
+            "findings": [],
         },
         "application": {
             "total": Counter(),
             "fixable": Counter(),
+            "no_fix_reported": Counter(),
+            "findings": [],
         },
     }
 
@@ -153,12 +156,8 @@ def parse_vulnerabilities(variant):
         for finding in findings:
             severity = finding.get(
                 "Severity",
-                "UNKNOWN"
+                "UNKNOWN",
             ).upper()
-
-            result[
-                category
-            ]["total"][severity] += 1
 
             fixed_version = (
                 finding.get(
@@ -167,26 +166,136 @@ def parse_vulnerabilities(variant):
                 or ""
             ).strip()
 
+            installed_version = (
+                finding.get(
+                    "InstalledVersion"
+                )
+                or ""
+            ).strip()
+
+            vulnerability_id = (
+                finding.get(
+                    "VulnerabilityID"
+                )
+                or "UNKNOWN"
+            )
+
+            package = (
+                finding.get(
+                    "PkgName"
+                )
+                or "unknown"
+            )
+
+            status = (
+                finding.get(
+                    "Status"
+                )
+                or "unknown"
+            )
+
+            title = (
+                finding.get(
+                    "Title"
+                )
+                or ""
+            )
+
+            result[
+                category
+            ]["total"][severity] += 1
+
             if fixed_version:
                 result[
                     category
                 ]["fixable"][severity] += 1
+            else:
+                result[
+                    category
+                ]["no_fix_reported"][severity] += 1
+
+            result[
+                category
+            ]["findings"].append({
+                "id": vulnerability_id,
+                "package": package,
+                "severity": severity,
+                "installed_version": installed_version,
+                "fixed_version": fixed_version,
+                "status": status,
+                "title": title,
+            })
 
     return result
 
 
+def representative_os_findings(
+    vulnerability_data,
+    limit=4,
+):
+    findings = vulnerability_data[
+        "os"
+    ]["findings"]
+
+    severity_order = {
+        "CRITICAL": 0,
+        "HIGH": 1,
+        "MEDIUM": 2,
+        "LOW": 3,
+        "UNKNOWN": 4,
+    }
+
+    relevant = [
+        finding
+        for finding in findings
+        if finding["severity"]
+        in BLOCKING_SEVERITIES
+    ]
+
+    relevant.sort(
+        key=lambda finding: (
+            0 if not finding["fixed_version"] else 1,
+            severity_order.get(
+                finding["severity"],
+                99,
+            ),
+            finding["id"],
+            finding["package"],
+        )
+    )
+
+    # One representative package per CVE.
+    unique = []
+    seen_ids = set()
+
+    for finding in relevant:
+        if finding["id"] in seen_ids:
+            continue
+
+        seen_ids.add(
+            finding["id"]
+        )
+
+        unique.append(
+            finding
+        )
+
+        if len(unique) >= limit:
+            break
+
+    return unique
+
+
 # ---------------------------------------------------------------------
-# Trivy configuration results
+# Misconfigurations — Trivy Config
 # ---------------------------------------------------------------------
 
 def parse_misconfigurations(variant):
-    path = (
+    data = read_json(
         RESULTS_DIR
         / variant
         / "trivy-config.json"
     )
-
-    data = read_json(path)
 
     counts = Counter()
 
@@ -201,7 +310,7 @@ def parse_misconfigurations(variant):
         for finding in findings:
             severity = finding.get(
                 "Severity",
-                "UNKNOWN"
+                "UNKNOWN",
             ).upper()
 
             counts[severity] += 1
@@ -210,21 +319,19 @@ def parse_misconfigurations(variant):
 
 
 # ---------------------------------------------------------------------
-# Runtime results
+# Runtime — custom checks
 # ---------------------------------------------------------------------
 
 def parse_runtime(variant):
-    path = (
+    return read_json(
         RESULTS_DIR
         / variant
         / "runtime.json"
     )
 
-    return read_json(path)
-
 
 # ---------------------------------------------------------------------
-# DCLint
+# Docker Compose — DCLint
 # ---------------------------------------------------------------------
 
 def parse_dclint(variant):
@@ -244,7 +351,6 @@ def parse_dclint(variant):
 
     text = path.read_text()
 
-    # Explicit clean result produced by the pipeline.
     if "DCLINT_RESULT=PASS" in text:
         return {
             "available": True,
@@ -253,7 +359,16 @@ def parse_dclint(variant):
             "warnings": 0,
         }
 
-    # When findings exist, DCLint prints its normal summary.
+    # Compatibility with local runs where a clean DCLint
+    # execution produced an empty file.
+    if not text.strip():
+        return {
+            "available": True,
+            "problems": 0,
+            "errors": 0,
+            "warnings": 0,
+        }
+
     match = re.search(
         r"(\d+)\s+problems?\s+"
         r"\((\d+)\s+errors?,\s+"
@@ -264,13 +379,17 @@ def parse_dclint(variant):
     if match:
         return {
             "available": True,
-            "problems": int(match.group(1)),
-            "errors": int(match.group(2)),
-            "warnings": int(match.group(3)),
+            "problems": int(
+                match.group(1)
+            ),
+            "errors": int(
+                match.group(2)
+            ),
+            "warnings": int(
+                match.group(3)
+            ),
         }
 
-    # FAIL without a parsable DCLint report means the tool itself
-    # did not complete correctly. Fail closed.
     return {
         "available": False,
         "problems": None,
@@ -280,7 +399,7 @@ def parse_dclint(variant):
 
 
 # ---------------------------------------------------------------------
-# Complete variant analysis
+# Variant analysis
 # ---------------------------------------------------------------------
 
 def analyse_variant(variant):
@@ -316,17 +435,18 @@ def evaluate_gate(result, policy):
 
     checks = []
 
-    def add_check(name, passed, detail):
+    def add_check(
+        name,
+        passed,
+        detail,
+    ):
         checks.append({
             "name": name,
             "passed": passed,
             "detail": detail,
         })
 
-    # -------------------------------------------------------------
-    # Application vulnerabilities
-    # -------------------------------------------------------------
-
+    # Application CVEs
     app_policy = gate_policy[
         "application_vulnerabilities"
     ]
@@ -337,7 +457,7 @@ def evaluate_gate(result, policy):
 
     if app_policy.get(
         "require_fix_available",
-        False
+        False,
     ):
         app_source = app_results[
             "fixable"
@@ -354,25 +474,22 @@ def evaluate_gate(result, policy):
     blocking_app = sum(
         counter_value(
             app_source,
-            severity
+            severity,
         )
         for severity
         in app_policy["severities"]
     )
 
     add_check(
-        "Application vulnerability policy",
+        "Application CVEs — Trivy Image",
         blocking_app == 0,
         (
             f"{blocking_app} {qualifier} "
-            "blocking vulnerability findings"
+            "blocking findings"
         ),
     )
 
-    # -------------------------------------------------------------
-    # Operating-system vulnerabilities
-    # -------------------------------------------------------------
-
+    # OS CVEs
     os_policy = gate_policy[
         "os_vulnerabilities"
     ]
@@ -383,7 +500,7 @@ def evaluate_gate(result, policy):
 
     if os_policy.get(
         "require_fix_available",
-        False
+        False,
     ):
         os_source = os_results[
             "fixable"
@@ -400,25 +517,22 @@ def evaluate_gate(result, policy):
     blocking_os = sum(
         counter_value(
             os_source,
-            severity
+            severity,
         )
         for severity
         in os_policy["severities"]
     )
 
     add_check(
-        "Operating-system vulnerability policy",
+        "OS CVEs — Trivy Image",
         blocking_os == 0,
         (
             f"{blocking_os} {qualifier} "
-            "blocking vulnerability findings"
+            "blocking findings"
         ),
     )
 
-    # -------------------------------------------------------------
-    # Trivy configuration
-    # -------------------------------------------------------------
-
+    # Trivy Config
     misconfiguration_policy = (
         gate_policy[
             "misconfigurations"
@@ -427,8 +541,10 @@ def evaluate_gate(result, policy):
 
     blocking_misconfigs = sum(
         counter_value(
-            result["misconfigurations"],
-            severity
+            result[
+                "misconfigurations"
+            ],
+            severity,
         )
         for severity
         in misconfiguration_policy[
@@ -437,7 +553,7 @@ def evaluate_gate(result, policy):
     )
 
     add_check(
-        "Trivy configuration policy",
+        "Container config — Trivy Config",
         blocking_misconfigs == 0,
         (
             f"{blocking_misconfigs} "
@@ -445,11 +561,10 @@ def evaluate_gate(result, policy):
         ),
     )
 
-    # -------------------------------------------------------------
     # Runtime
-    # -------------------------------------------------------------
-
-    runtime = result["runtime"]
+    runtime = result[
+        "runtime"
+    ]
 
     runtime_policy = gate_policy[
         "runtime"
@@ -457,7 +572,7 @@ def evaluate_gate(result, policy):
 
     if runtime_policy.get(
         "require_healthy",
-        False
+        False,
     ):
         healthy = (
             runtime.get(
@@ -467,7 +582,7 @@ def evaluate_gate(result, policy):
         )
 
         add_check(
-            "Application health",
+            "Runtime — application health",
             healthy,
             (
                 "health endpoint responded correctly"
@@ -478,7 +593,7 @@ def evaluate_gate(result, policy):
 
     if runtime_policy.get(
         "forbid_root",
-        False
+        False,
     ):
         non_root = (
             runtime.get(
@@ -492,7 +607,7 @@ def evaluate_gate(result, policy):
         )
 
         add_check(
-            "Non-root execution",
+            "Runtime — non-root execution",
             non_root,
             (
                 f"runtime UID={uid}"
@@ -503,7 +618,7 @@ def evaluate_gate(result, policy):
 
     if runtime_policy.get(
         "require_read_only_root_filesystem",
-        False
+        False,
     ):
         read_only = (
             runtime.get(
@@ -513,7 +628,7 @@ def evaluate_gate(result, policy):
         )
 
         add_check(
-            "Read-only root filesystem",
+            "Runtime — read-only root filesystem",
             read_only,
             (
                 "write attempt was denied"
@@ -525,10 +640,7 @@ def evaluate_gate(result, policy):
             ),
         )
 
-    # -------------------------------------------------------------
     # DCLint
-    # -------------------------------------------------------------
-
     dclint_policy = gate_policy.get(
         "dclint",
         {
@@ -537,11 +649,13 @@ def evaluate_gate(result, policy):
         },
     )
 
-    dclint = result["dclint"]
+    dclint = result[
+        "dclint"
+    ]
 
     if not dclint["available"]:
         add_check(
-            "Docker Compose lint",
+            "Docker Compose — DCLint",
             False,
             "DCLint result unavailable",
         )
@@ -559,7 +673,7 @@ def evaluate_gate(result, policy):
         )
 
         add_check(
-            "Docker Compose lint",
+            "Docker Compose — DCLint",
             dclint_ok,
             (
                 f"{dclint['errors']} errors, "
@@ -570,18 +684,22 @@ def evaluate_gate(result, policy):
     failures = [
         check
         for check in checks
-        if not check["passed"]
+        if not check[
+            "passed"
+        ]
     ]
 
     return {
-        "passed": len(failures) == 0,
+        "passed": len(
+            failures
+        ) == 0,
         "checks": checks,
         "failures": failures,
     }
 
 
 # ---------------------------------------------------------------------
-# Terminal output
+# Terminal report
 # ---------------------------------------------------------------------
 
 def print_terminal_report(
@@ -597,14 +715,6 @@ def print_terminal_report(
         "vulnerabilities"
     ]
 
-    baseline_os = baseline_vulns[
-        "os"
-    ]
-
-    hardened_os = hardened_vulns[
-        "os"
-    ]
-
     baseline_app = baseline_vulns[
         "application"
     ]
@@ -613,12 +723,12 @@ def print_terminal_report(
         "application"
     ]
 
-    baseline_misconfig = baseline[
-        "misconfigurations"
+    baseline_os = baseline_vulns[
+        "os"
     ]
 
-    hardened_misconfig = hardened[
-        "misconfigurations"
+    hardened_os = hardened_vulns[
+        "os"
     ]
 
     baseline_runtime = baseline[
@@ -645,67 +755,6 @@ def print_terminal_report(
         "sbom"
     ]["package_entries"]
 
-    app_before = high_critical(
-        baseline_app["total"]
-    )
-
-    app_after = high_critical(
-        hardened_app["total"]
-    )
-
-    app_fixable_before = high_critical(
-        baseline_app["fixable"]
-    )
-
-    app_fixable_after = high_critical(
-        hardened_app["fixable"]
-    )
-
-    misconfig_before = high_critical(
-        baseline_misconfig
-    )
-
-    misconfig_after = high_critical(
-        hardened_misconfig
-    )
-
-    os_high_before = counter_value(
-        baseline_os["total"],
-        "HIGH"
-    )
-
-    os_high_after = counter_value(
-        hardened_os["total"],
-        "HIGH"
-    )
-
-    os_critical_before = counter_value(
-        baseline_os["total"],
-        "CRITICAL"
-    )
-
-    os_critical_after = counter_value(
-        hardened_os["total"],
-        "CRITICAL"
-    )
-
-    os_total_before = (
-        os_high_before
-        + os_critical_before
-    )
-
-    os_total_after = (
-        os_high_after
-        + os_critical_after
-    )
-
-    os_fixable_critical_after = (
-        counter_value(
-            hardened_os["fixable"],
-            "CRITICAL"
-        )
-    )
-
     print()
     print(
         "CONTAINER SECURITY PIPELINE"
@@ -716,48 +765,54 @@ def print_terminal_report(
     print()
 
     print(
-        "FINAL RESULT: "
+        f"FINAL RESULT: "
         f"{pass_fail(gate_result['passed'])}"
     )
-
     print()
 
     # -------------------------------------------------------------
-    # Remediation summary
+    # Application
     # -------------------------------------------------------------
 
     print(
-        "REMEDIATION SUMMARY"
+        "APPLICATION DEPENDENCIES — TRIVY IMAGE"
     )
     print(
-        "-" * 19
-    )
-
-    print(
-        "Application vulnerabilities:"
+        "-" * 38
     )
 
     print(
-        "  HIGH + CRITICAL ................. "
-        f"{app_before} -> {app_after}"
+        "  HIGH + CRITICAL CVEs ............ "
+        f"{high_critical(baseline_app['total'])}"
+        " -> "
+        f"{high_critical(hardened_app['total'])}"
     )
 
     print(
         "  Fixable HIGH + CRITICAL ......... "
-        f"{app_fixable_before} -> "
-        f"{app_fixable_after}"
+        f"{high_critical(baseline_app['fixable'])}"
+        " -> "
+        f"{high_critical(hardened_app['fixable'])}"
     )
 
     print()
 
+    # -------------------------------------------------------------
+    # Configuration
+    # -------------------------------------------------------------
+
     print(
-        "Container configuration:"
+        "CONTAINER CONFIGURATION"
+    )
+    print(
+        "-" * 23
     )
 
     print(
-        "  Trivy HIGH + CRITICAL ........... "
-        f"{misconfig_before} -> "
-        f"{misconfig_after}"
+        "  Trivy Config HIGH + CRITICAL .... "
+        f"{high_critical(baseline['misconfigurations'])}"
+        " -> "
+        f"{high_critical(hardened['misconfigurations'])}"
     )
 
     if (
@@ -766,7 +821,8 @@ def print_terminal_report(
     ):
         print(
             "  DCLint problems ................. "
-            f"{baseline_dclint['problems']} -> "
+            f"{baseline_dclint['problems']}"
+            " -> "
             f"{hardened_dclint['problems']}"
         )
     else:
@@ -777,8 +833,15 @@ def print_terminal_report(
 
     print()
 
+    # -------------------------------------------------------------
+    # Runtime
+    # -------------------------------------------------------------
+
     print(
-        "Runtime security:"
+        "RUNTIME VALIDATION — CUSTOM CHECKS"
+    )
+    print(
+        "-" * 34
     )
 
     print(
@@ -810,65 +873,154 @@ def print_terminal_report(
     print()
 
     # -------------------------------------------------------------
-    # Residual risk
+    # OS residual/upstream findings
     # -------------------------------------------------------------
 
     print(
-        "RESIDUAL RISK"
+        "REMAINING OS VULNERABILITIES — TRIVY IMAGE"
     )
     print(
-        "-" * 13
+        "-" * 43
+    )
+
+    for severity in (
+        "HIGH",
+        "CRITICAL",
+    ):
+        before = counter_value(
+            baseline_os["total"],
+            severity,
+        )
+
+        after = counter_value(
+            hardened_os["total"],
+            severity,
+        )
+
+        fixable = counter_value(
+            hardened_os["fixable"],
+            severity,
+        )
+
+        no_fix = counter_value(
+            hardened_os[
+                "no_fix_reported"
+            ],
+            severity,
+        )
+
+        print(
+            f"  {severity:<8} "
+            f"{before:>3} -> {after:<3} "
+            f"(fix available: {fixable}, "
+            f"no fix reported: {no_fix})"
+        )
+
+    print()
+
+    remaining_fixable = (
+        high_critical(
+            hardened_os[
+                "fixable"
+            ]
+        )
+    )
+
+    remaining_no_fix = (
+        high_critical(
+            hardened_os[
+                "no_fix_reported"
+            ]
+        )
     )
 
     print(
-        "Operating-system vulnerabilities:"
+        "  Remaining HIGH/CRITICAL:"
     )
 
     print(
-        "  HIGH ............................ "
-        f"{os_high_before} -> {os_high_after}"
+        "    Fix available .................. "
+        f"{remaining_fixable}"
     )
 
     print(
-        "  CRITICAL ........................ "
-        f"{os_critical_before} -> "
-        f"{os_critical_after}"
-    )
-
-    print(
-        "  HIGH + CRITICAL total ........... "
-        f"{os_total_before} -> "
-        f"{os_total_after}"
-    )
-
-    print(
-        "  Fixable CRITICAL after hardening  "
-        f"{os_fixable_critical_after}"
+        "    No fixed version reported ...... "
+        f"{remaining_no_fix}"
     )
 
     print()
 
-    print(
-        "  Remaining non-blocking OS findings "
-        "are retained as residual risk."
+    if remaining_no_fix:
+        print(
+            "  Findings without a fixed version "
+            "reported by Trivy are retained"
+        )
+
+        print(
+            "  as upstream residual risk at scan time."
+        )
+
+    if remaining_fixable:
+        print(
+            "  Fixable OS findings outside the "
+            "configured blocking policy remain"
+        )
+
+        print(
+            "  visible and are not silently ignored."
+        )
+
+    examples = representative_os_findings(
+        hardened_vulns
     )
+
+    if examples:
+        print()
+        print(
+            "  Representative remaining findings:"
+        )
+
+        for finding in examples:
+            if finding[
+                "fixed_version"
+            ]:
+                remediation = (
+                    "fix: "
+                    + finding[
+                        "fixed_version"
+                    ]
+                )
+            else:
+                remediation = (
+                    "no fixed version reported"
+                )
+
+            print(
+                "    "
+                f"{finding['id']} | "
+                f"{finding['package']} | "
+                f"{finding['severity']} | "
+                f"{remediation}"
+            )
 
     print()
 
     # -------------------------------------------------------------
-    # Inventory
+    # SBOM
     # -------------------------------------------------------------
 
     print(
-        "SOFTWARE INVENTORY"
+        "SOFTWARE INVENTORY — SYFT SBOM"
     )
     print(
-        "-" * 18
+        "-" * 30
     )
 
     print(
-        "  SBOM package entries ............ "
-        f"{baseline_sbom} -> {hardened_sbom}"
+        "  Package entries ................. "
+        f"{baseline_sbom}"
+        " -> "
+        f"{hardened_sbom}"
     )
 
     print(
@@ -894,31 +1046,36 @@ def print_terminal_report(
     ]:
         marker = (
             "PASS"
-            if check["passed"]
+            if check[
+                "passed"
+            ]
             else "FAIL"
         )
 
         print(
-            f"  [{marker}] {check['name']}"
+            f"  [{marker}] "
+            f"{check['name']}"
         )
 
         print(
-            f"         {check['detail']}"
+            f"         "
+            f"{check['detail']}"
         )
 
     print()
 
-    if gate_result["passed"]:
-        print(
-            "FINAL RESULT: PASS"
-        )
+    print(
+        f"FINAL RESULT: "
+        f"{pass_fail(gate_result['passed'])}"
+    )
+
+    if gate_result[
+        "passed"
+    ]:
         print(
             "All blocking controls passed."
         )
     else:
-        print(
-            "FINAL RESULT: FAIL"
-        )
         print(
             f"{len(gate_result['failures'])} "
             "blocking control(s) failed."
@@ -945,7 +1102,7 @@ def print_terminal_report(
 
 
 # ---------------------------------------------------------------------
-# Markdown output for GitHub Actions
+# Markdown report — GitHub Job Summary
 # ---------------------------------------------------------------------
 
 def generate_markdown(
@@ -977,14 +1134,6 @@ def generate_markdown(
         "os"
     ]
 
-    baseline_misconfig = baseline[
-        "misconfigurations"
-    ]
-
-    hardened_misconfig = hardened[
-        "misconfigurations"
-    ]
-
     baseline_runtime = baseline[
         "runtime"
     ]
@@ -1003,14 +1152,16 @@ def generate_markdown(
 
     final_icon = (
         "✅"
-        if gate_result["passed"]
+        if gate_result[
+            "passed"
+        ]
         else "❌"
     )
 
-    final_text = (
-        "PASS"
-        if gate_result["passed"]
-        else "FAIL"
+    final_text = pass_fail(
+        gate_result[
+            "passed"
+        ]
     )
 
     lines = [
@@ -1021,66 +1172,176 @@ def generate_markdown(
             f"{final_text}"
         ),
         "",
-        "### Remediation summary",
+        "## Remediation summary",
         "",
-        "| Control | Baseline | Hardened | Evolution |",
-        "|---|---:|---:|---|",
+        "### Application dependencies — Trivy Image",
+        "",
+        "| Control | Baseline | Hardened |",
+        "|---|---:|---:|",
         (
-            "| Application HIGH + CRITICAL CVEs | "
+            "| HIGH + CRITICAL CVEs | "
             f"{high_critical(baseline_app['total'])} | "
-            f"{high_critical(hardened_app['total'])} | "
-            f"{high_critical(baseline_app['total'])} → "
             f"{high_critical(hardened_app['total'])} |"
         ),
         (
-            "| Fixable application HIGH + CRITICAL | "
+            "| Fixable HIGH + CRITICAL | "
             f"{high_critical(baseline_app['fixable'])} | "
-            f"{high_critical(hardened_app['fixable'])} | "
-            f"{high_critical(baseline_app['fixable'])} → "
             f"{high_critical(hardened_app['fixable'])} |"
         ),
+        "",
+        "### Container configuration — Trivy Config + DCLint",
+        "",
+        "| Control | Baseline | Hardened |",
+        "|---|---:|---:|",
         (
             "| Trivy HIGH + CRITICAL misconfigurations | "
-            f"{high_critical(baseline_misconfig)} | "
-            f"{high_critical(hardened_misconfig)} | "
-            f"{high_critical(baseline_misconfig)} → "
-            f"{high_critical(hardened_misconfig)} |"
+            f"{high_critical(baseline['misconfigurations'])} | "
+            f"{high_critical(hardened['misconfigurations'])} |"
         ),
     ]
 
     if (
-        baseline_dclint["available"]
-        and hardened_dclint["available"]
+        baseline_dclint[
+            "available"
+        ]
+        and hardened_dclint[
+            "available"
+        ]
     ):
         lines.append(
             "| DCLint problems | "
             f"{baseline_dclint['problems']} | "
-            f"{hardened_dclint['problems']} | "
-            f"{baseline_dclint['problems']} → "
             f"{hardened_dclint['problems']} |"
         )
 
     lines.extend([
+        "",
+        "### Runtime validation — custom checks",
+        "",
+        "| Control | Baseline | Hardened |",
+        "|---|---:|---:|",
         (
             "| Running as root | "
             f"{yes_no(baseline_runtime.get('running_as_root'))} | "
-            f"{yes_no(hardened_runtime.get('running_as_root'))} | "
-            "Hardened |"
+            f"{yes_no(hardened_runtime.get('running_as_root'))} |"
         ),
         (
             "| Root filesystem writable | "
             f"{yes_no(baseline_runtime.get('root_filesystem_writable'))} | "
-            f"{yes_no(hardened_runtime.get('root_filesystem_writable'))} | "
-            "Hardened |"
+            f"{yes_no(hardened_runtime.get('root_filesystem_writable'))} |"
         ),
         (
             "| Application healthy | "
             f"{yes_no(baseline_runtime.get('healthcheck'))} | "
-            f"{yes_no(hardened_runtime.get('healthcheck'))} | "
-            "Preserved |"
+            f"{yes_no(hardened_runtime.get('healthcheck'))} |"
+        ),
+        (
+            "| Runtime UID | "
+            f"{baseline_runtime.get('uid', 'Unknown')} | "
+            f"{hardened_runtime.get('uid', 'Unknown')} |"
         ),
         "",
-        "### Pipeline gate",
+        "## Remaining OS vulnerabilities — Trivy Image",
+        "",
+        (
+            "These findings come from operating-system packages "
+            "inside the container image."
+        ),
+        "",
+        (
+            "| Severity | Baseline | Hardened | "
+            "Fix available | No fix reported |"
+        ),
+        "|---|---:|---:|---:|---:|",
+    ])
+
+    for severity in (
+        "HIGH",
+        "CRITICAL",
+    ):
+        lines.append(
+            f"| {severity} | "
+            f"{counter_value(baseline_os['total'], severity)} | "
+            f"{counter_value(hardened_os['total'], severity)} | "
+            f"{counter_value(hardened_os['fixable'], severity)} | "
+            f"{counter_value(hardened_os['no_fix_reported'], severity)} |"
+        )
+
+    remaining_fixable = high_critical(
+        hardened_os[
+            "fixable"
+        ]
+    )
+
+    remaining_no_fix = high_critical(
+        hardened_os[
+            "no_fix_reported"
+        ]
+    )
+
+    lines.extend([
+        "",
+        (
+            f"- **Fix available:** "
+            f"{remaining_fixable} HIGH/CRITICAL findings."
+        ),
+        (
+            f"- **No fixed version reported by Trivy:** "
+            f"{remaining_no_fix} HIGH/CRITICAL findings."
+        ),
+        "",
+        (
+            "Findings for which Trivy does not report a fixed "
+            "version are retained as **upstream residual risk "
+            "at scan time**. The pipeline does not fabricate "
+            "or apply unsupported package remediations."
+        ),
+    ])
+
+    if remaining_fixable:
+        lines.extend([
+            "",
+            (
+                "Fixable OS findings that fall outside the "
+                "configured blocking policy remain visible "
+                "in the evidence and are not silently ignored."
+            ),
+        ])
+
+    examples = representative_os_findings(
+        hardened_vulns
+    )
+
+    if examples:
+        lines.extend([
+            "",
+            "### Representative remaining OS findings",
+            "",
+        ])
+
+        for finding in examples:
+            if finding[
+                "fixed_version"
+            ]:
+                remediation = (
+                    f"fixed version: "
+                    f"`{finding['fixed_version']}`"
+                )
+            else:
+                remediation = (
+                    "no fixed version reported"
+                )
+
+            lines.append(
+                f"- `{finding['id']}` — "
+                f"`{finding['package']}` — "
+                f"**{finding['severity']}** — "
+                f"{remediation}."
+            )
+
+    lines.extend([
+        "",
+        "## Pipeline gate",
         "",
     ])
 
@@ -1089,67 +1350,49 @@ def generate_markdown(
     ]:
         icon = (
             "✅"
-            if check["passed"]
+            if check[
+                "passed"
+            ]
             else "❌"
         )
 
         lines.append(
-            f"- {icon} **{check['name']}** — "
+            f"- {icon} "
+            f"**{check['name']}** — "
             f"{check['detail']}"
         )
 
     lines.extend([
         "",
-        "### Residual risk",
-        "",
-        "| OS severity | Baseline | Hardened |",
-        "|---|---:|---:|",
-        (
-            "| HIGH | "
-            f"{counter_value(baseline_os['total'], 'HIGH')} | "
-            f"{counter_value(hardened_os['total'], 'HIGH')} |"
-        ),
-        (
-            "| CRITICAL | "
-            f"{counter_value(baseline_os['total'], 'CRITICAL')} | "
-            f"{counter_value(hardened_os['total'], 'CRITICAL')} |"
-        ),
-        (
-            "| HIGH + CRITICAL | "
-            f"{high_critical(baseline_os['total'])} | "
-            f"{high_critical(hardened_os['total'])} |"
-        ),
+        "## Software inventory — Syft SBOM",
         "",
         (
-            "Remaining operating-system findings are retained "
-            "in the audit evidence as residual risk. "
-            "The pipeline blocks only findings that violate "
-            "the configured gate policy."
-        ),
-        "",
-        "### Software inventory",
-        "",
-        (
-            f"- SBOM package entries: "
-            f"**{baseline['sbom']['package_entries']} → "
-            f"{hardened['sbom']['package_entries']}**"
+            f"- Package entries: "
+            f"**{baseline['sbom']['package_entries']} "
+            f"→ {hardened['sbom']['package_entries']}**"
         ),
         (
-            f"- Hardened runtime UID: "
-            f"**{hardened_runtime.get('uid', 'Unknown')}**"
+            "- Delta: **"
+            + delta(
+                baseline["sbom"]["package_entries"],
+                hardened["sbom"]["package_entries"],
+            )
+            + "**"
         ),
         "",
-        "### Evidence",
+        "## Evidence",
         "",
-        "- Syft SBOM generated for baseline and hardened images.",
-        "- Trivy image vulnerability reports retained as JSON.",
-        "- Trivy configuration reports retained as JSON.",
-        "- DCLint output retained for Docker Compose validation.",
+        "- Syft SBOM for baseline and hardened images.",
+        "- Trivy Image vulnerability reports retained as JSON.",
+        "- Trivy Config reports retained as JSON.",
+        "- DCLint Docker Compose validation retained as evidence.",
         "- Runtime validation retained as structured JSON.",
     ])
 
     return (
-        "\n".join(lines)
+        "\n".join(
+            lines
+        )
         + "\n"
     )
 
@@ -1173,7 +1416,7 @@ def main():
 
     gate_result = evaluate_gate(
         hardened,
-        policy
+        policy,
     )
 
     comparison = {
@@ -1214,7 +1457,9 @@ def main():
         gate_result,
     )
 
-    if not gate_result["passed"]:
+    if not gate_result[
+        "passed"
+    ]:
         raise SystemExit(1)
 
 
