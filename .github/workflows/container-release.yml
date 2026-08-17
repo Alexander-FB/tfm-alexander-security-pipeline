@@ -1,0 +1,146 @@
+name: Container Release
+
+on:
+  workflow_call:
+    inputs:
+      aws_region:
+        description: AWS region used for ECR and S3
+        required: true
+        type: string
+
+      aws_role_arn:
+        description: IAM role assumed through GitHub OIDC
+        required: true
+        type: string
+
+      ecr_repository:
+        description: Amazon ECR repository name
+        required: true
+        type: string
+
+      s3_bucket:
+        description: S3 bucket containing security evidence
+        required: true
+        type: string
+
+
+jobs:
+  release:
+    name: Validate and publish
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout main commit
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Validate merged application
+        id: audit
+        uses: Alexander-FB/tfm-alexander-security-pipeline/.github/actions/container-security@main
+        with:
+          phase: baseline
+
+      - name: Reject non-compliant main
+        shell: bash
+        env:
+          REMEDIATION_REQUIRED: ${{ steps.audit.outputs.remediation_required }}
+        run: |
+          echo "Remediation required: ${REMEDIATION_REQUIRED}"
+
+          if [ "${REMEDIATION_REQUIRED}" != "false" ]; then
+            echo
+            echo "ERROR: main does not satisfy the central security policy."
+            echo "The release will not modify main automatically."
+            echo "Create a pull request containing the required remediation."
+            exit 1
+          fi
+
+          echo "Merged commit satisfies the central security policy."
+
+      - name: Prepare final release evidence
+        shell: bash
+        run: |
+          rm -rf results/hardened
+          cp -a results/baseline results/hardened
+
+      - name: Evaluate final release gate
+        uses: Alexander-FB/tfm-alexander-security-pipeline/.github/actions/container-security@main
+        with:
+          phase: report
+
+      - name: Store GitHub release evidence
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-security-evidence-${{ github.sha }}
+          path: results/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Configure AWS credentials through OIDC
+        uses: aws-actions/configure-aws-credentials@v6.2.3
+        with:
+          role-to-assume: ${{ inputs.aws_role_arn }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2.1.6
+
+      - name: Publish validated application image
+        shell: bash
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ inputs.ecr_repository }}
+        run: |
+          IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}:${GITHUB_SHA}"
+
+          echo "Publishing validated image:"
+          echo "${IMAGE_URI}"
+
+          docker tag \
+            tfm-api:baseline \
+            "${IMAGE_URI}"
+
+          docker push \
+            "${IMAGE_URI}"
+
+          echo "IMAGE_URI=${IMAGE_URI}" >> "$GITHUB_ENV"
+
+      - name: Publish security evidence to S3
+        shell: bash
+        env:
+          S3_BUCKET: ${{ inputs.s3_bucket }}
+        run: |
+          DESTINATION="s3://${S3_BUCKET}/${GITHUB_SHA}/"
+
+          echo "Publishing release evidence:"
+          echo "${DESTINATION}"
+
+          aws s3 cp \
+            results/ \
+            "${DESTINATION}" \
+            --recursive \
+            --only-show-errors
+
+      - name: Release summary
+        shell: bash
+        env:
+          S3_BUCKET: ${{ inputs.s3_bucket }}
+        run: |
+          {
+            echo "# 🚀 Container release"
+            echo
+            echo "✅ Merged commit validated successfully."
+            echo
+            echo "| Artifact | Destination |"
+            echo "|---|---|"
+            echo "| Container image | \`${IMAGE_URI}\` |"
+            echo "| Security evidence | \`s3://${S3_BUCKET}/${GITHUB_SHA}/\` |"
+            echo
+            echo "**Commit:** \`${GITHUB_SHA}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
