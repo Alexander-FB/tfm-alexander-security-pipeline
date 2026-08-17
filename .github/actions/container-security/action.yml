@@ -6,6 +6,11 @@ inputs:
     description: Pipeline phase to execute
     required: true
 
+outputs:
+  remediation_required:
+    description: Whether the audited baseline requires automated hardening
+    value: ${{ steps.assess.outputs.remediation_required }}
+
 runs:
   using: composite
 
@@ -181,6 +186,16 @@ runs:
         docker compose down \
           -v \
           --remove-orphans || true
+
+    - name: Evaluate baseline compliance
+      if: ${{ inputs.phase == 'baseline' }}
+      id: assess
+      shell: bash
+      env:
+        CONTAINER_SECURITY_POLICY: ${{ github.action_path }}/policy/container-security-policy.yml
+      run: |
+        python \
+          "$GITHUB_ACTION_PATH/scripts/assess.py"
 
     # ================================================================
     # REMEDIATION
