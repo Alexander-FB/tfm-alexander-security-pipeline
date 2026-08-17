@@ -1,0 +1,47 @@
+dockerfile:
+  base_image: "python:3.13.14-slim-trixie"
+  user: "10001:10001"
+  add_healthcheck: true
+
+dependencies:
+  fastapi: "0.141.1"
+  uvicorn: "0.51.0"
+
+compose:
+  project_name: "tfm-alexander-container-security"
+
+  api:
+    image: "tfm-api:hardened"
+    read_only: true
+    no_new_privileges: true
+    drop_capabilities: true
+    memory_limit: "256m"
+    cpus: 0.5
+
+  nginx:
+    bind_address: "127.0.0.1"
+gate:
+  application_vulnerabilities:
+    severities:
+      - HIGH
+      - CRITICAL
+    require_fix_available: true
+
+  os_vulnerabilities:
+    severities:
+      - CRITICAL
+    require_fix_available: true
+
+  misconfigurations:
+    severities:
+      - HIGH
+      - CRITICAL
+
+  runtime:
+    require_healthy: true
+    forbid_root: true
+    require_read_only_root_filesystem: true
+
+  dclint:
+    max_errors: 0
+    max_warnings: 0
