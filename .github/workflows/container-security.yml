@@ -1,0 +1,106 @@
+name: Reusable Container Security Pipeline
+
+on:
+  workflow_call:
+
+permissions:
+  contents: write
+
+jobs:
+  container-security:
+    name: Container Security
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout pull request branch
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          check-latest: false
+
+      - name: Install Syft
+        id: syft
+        uses: anchore/sbom-action/download-syft@v0.24.0
+        with:
+          syft-version: v1.50.0
+
+      - name: Add Syft to PATH
+        shell: bash
+        run: |
+          echo "$(dirname '${{ steps.syft.outputs.cmd }}')" \
+            >> "$GITHUB_PATH"
+
+      - name: Install Trivy
+        uses: aquasecurity/setup-trivy@e07451d2e059ed86c2870430ea286b3a9e0bf241
+        with:
+          version: v0.72.0
+          cache: true
+
+      - name: Run container security engine
+        uses: Alexander-FB/tfm-alexander-security-pipeline/.github/actions/container-security@main
+
+      - name: Publish pipeline summary
+        if: always()
+        shell: bash
+        run: |
+          if [ -f results/comparison.md ]; then
+            cat results/comparison.md \
+              >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "# 🛡️ Container Security Pipeline"
+              echo
+              echo "## ❌ Pipeline execution failed"
+              echo
+              echo "The pipeline stopped before the comparison report could be generated."
+              echo
+              echo "Inspect the workflow logs and generated artifacts for details."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload security evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: container-security-${{ github.sha }}
+          path: results/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Commit automated hardening
+        if: >-
+          ${{
+            success() &&
+            github.event_name == 'pull_request' &&
+            github.event.pull_request.head.repo.full_name == github.repository
+          }}
+        shell: bash
+        run: |
+          git add \
+            app/Dockerfile \
+            app/requirements.txt \
+            docker-compose.yml
+
+          if git diff --cached --quiet; then
+            echo "No hardening changes to commit."
+            exit 0
+          fi
+
+          git config \
+            user.name \
+            "github-actions[bot]"
+
+          git config \
+            user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git commit \
+            -m "chore(security): apply automated container hardening"
+
+          git push
