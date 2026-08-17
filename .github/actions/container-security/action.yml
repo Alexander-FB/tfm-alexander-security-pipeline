@@ -492,5 +492,17 @@ runs:
       env:
         CONTAINER_SECURITY_POLICY: ${{ github.action_path }}/policy/container-security-policy.yml
       run: |
+        report_status=0
+        nginx_status=0
+
         python \
-          "$GITHUB_ACTION_PATH/scripts/report.py"
+          "$GITHUB_ACTION_PATH/scripts/report.py" \
+          || report_status=$?
+
+        python \
+          "$GITHUB_ACTION_PATH/scripts/nginx_report.py" \
+          || nginx_status=$?
+
+        if [ "$report_status" -ne 0 ] || [ "$nginx_status" -ne 0 ]; then
+          exit 1
+        fi

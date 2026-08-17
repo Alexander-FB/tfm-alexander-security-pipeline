@@ -1409,11 +1409,9 @@ def generate_markdown(
         )
 
         assessment_text = (
-            "No remediation was required. The received application "
-            "already satisfied the configured security policy, so "
-            "the remediation path was skipped."
+            "The final application state satisfies "
+            "the configured security policy."
         )
-
     # -------------------------------------------------------------
     # 2x2 security overview
     # -------------------------------------------------------------
@@ -1825,10 +1823,6 @@ def generate_markdown(
         "",
         f"## {assessment_title}",
         "",
-        (
-            f"> **Pipeline path:** "
-            f"{pipeline_path}  "
-        ),
         (
             f"> {assessment_text}"
         ),
