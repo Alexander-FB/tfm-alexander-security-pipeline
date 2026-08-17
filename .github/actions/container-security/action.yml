@@ -74,10 +74,23 @@ runs:
       if: ${{ inputs.phase == 'baseline' }}
       shell: bash
       run: |
+        compose_image="$(
+          docker compose config --format json \
+            | jq -r '.services.api.image'
+        )"
+
+        if [ -z "$compose_image" ] || [ "$compose_image" = "null" ]; then
+          echo "Unable to determine API image from Docker Compose."
+          exit 1
+        fi
+
+        echo "Compose expects API image: $compose_image"
+
         docker build \
           -t tfm-api:baseline \
+          -t "$compose_image" \
           ./app
-
+          
     - name: Generate baseline SBOM
       if: ${{ inputs.phase == 'baseline' }}
       shell: bash
@@ -249,7 +262,7 @@ runs:
           echo "DCLINT_RESULT=FAIL" >> results/hardened/dclint.txt
         fi
 
-        echo "DCLint hardened exit code: $exit_code"
+        echo "DCLint hardened exit code: $exit_code"Build baseline image
 
     - name: Start hardened environment
       if: ${{ inputs.phase == 'hardened' }}
