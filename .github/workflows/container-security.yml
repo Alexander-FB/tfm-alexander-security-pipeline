@@ -1,0 +1,338 @@
+name: Container Security
+
+on:
+  workflow_call:
+
+jobs:
+  baseline:
+    name: Baseline audit
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    outputs:
+      remediation_required: ${{ steps.audit.outputs.remediation_required }}
+
+    steps:
+      - name: Checkout application
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+
+      - name: Audit received application
+        id: audit
+        uses: Alexander-FB/tfm-alexander-security-pipeline/.github/actions/container-security@main
+        with:
+          phase: baseline
+
+      - name: Store baseline evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: baseline-evidence
+          path: results/baseline/
+          if-no-files-found: warn
+          retention-days: 14
+
+
+  remediate:
+    name: Apply hardening
+
+    needs:
+      - baseline
+
+    if: ${{ needs.baseline.outputs.remediation_required == 'true' }}
+
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout application
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+
+      - name: Apply central security policy
+        uses: Alexander-FB/tfm-alexander-security-pipeline/.github/actions/container-security@main
+        with:
+          phase: remediate
+
+      - name: Store hardened source
+        uses: actions/upload-artifact@v7
+        with:
+          name: hardened-source
+          path: |
+            app/Dockerfile
+            app/requirements.txt
+            docker-compose.yml
+          if-no-files-found: error
+          retention-days: 14
+
+
+  hardened:
+    name: Hardened validation
+
+    needs:
+      - baseline
+      - remediate
+
+    if: >-
+      ${{
+        needs.baseline.outputs.remediation_required == 'true' &&
+        needs.remediate.result == 'success'
+      }}
+
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout application
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+
+      - name: Restore hardened source
+        uses: actions/download-artifact@v8
+        with:
+          name: hardened-source
+          path: .
+
+      - name: Validate hardened application
+        uses: Alexander-FB/tfm-alexander-security-pipeline/.github/actions/container-security@main
+        with:
+          phase: hardened
+
+      - name: Store hardened evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: hardened-evidence
+          path: results/hardened/
+          if-no-files-found: warn
+          retention-days: 14
+
+
+  gate:
+    name: Security gate
+
+    needs:
+      - baseline
+      - remediate
+      - hardened
+
+    if: ${{ always() }}
+
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+      statuses: write
+
+    steps:
+      - name: Validate pipeline state
+        id: pipeline_state
+        shell: bash
+        env:
+          BASELINE_RESULT: ${{ needs.baseline.result }}
+          REMEDIATION_REQUIRED: ${{ needs.baseline.outputs.remediation_required }}
+          HARDENED_RESULT: ${{ needs.hardened.result }}
+        run: |
+          echo "Baseline result: ${BASELINE_RESULT}"
+          echo "Remediation required: ${REMEDIATION_REQUIRED}"
+          echo "Hardened validation result: ${HARDENED_RESULT}"
+
+          if [ "${BASELINE_RESULT}" != "success" ]; then
+            echo "Baseline audit did not complete successfully."
+            exit 1
+          fi
+
+          case "${REMEDIATION_REQUIRED}" in
+            false)
+              echo "Baseline already satisfies the security policy."
+              ;;
+
+            true)
+              if [ "${HARDENED_RESULT}" != "success" ]; then
+                echo "Remediation was required but hardened validation did not succeed."
+                exit 1
+              fi
+
+              echo "Automated remediation completed successfully."
+              ;;
+
+            *)
+              echo "Invalid or missing remediation decision."
+              exit 1
+              ;;
+          esac
+
+      - name: Checkout application
+        if: ${{ steps.pipeline_state.outcome == 'success' }}
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+
+      - name: Restore baseline evidence
+        if: ${{ steps.pipeline_state.outcome == 'success' }}
+        uses: actions/download-artifact@v8
+        with:
+          name: baseline-evidence
+          path: results/baseline
+
+      - name: Restore hardened source
+        if: >-
+          ${{
+            steps.pipeline_state.outcome == 'success' &&
+            needs.baseline.outputs.remediation_required == 'true'
+          }}
+        uses: actions/download-artifact@v8
+        with:
+          name: hardened-source
+          path: .
+
+      - name: Restore hardened evidence
+        if: >-
+          ${{
+            steps.pipeline_state.outcome == 'success' &&
+            needs.baseline.outputs.remediation_required == 'true'
+          }}
+        uses: actions/download-artifact@v8
+        with:
+          name: hardened-evidence
+          path: results/hardened
+
+      - name: Reuse compliant baseline as final evidence
+        if: >-
+          ${{
+            steps.pipeline_state.outcome == 'success' &&
+            needs.baseline.outputs.remediation_required == 'false'
+          }}
+        shell: bash
+        run: |
+          rm -rf results/hardened
+          cp -a results/baseline results/hardened
+
+          echo "No remediation was required."
+          echo "The audited baseline is also the final validated state."
+
+      - name: Evaluate security gate
+        id: gate_evaluation
+        if: ${{ steps.pipeline_state.outcome == 'success' }}
+        uses: Alexander-FB/tfm-alexander-security-pipeline/.github/actions/container-security@main
+        with:
+          phase: report
+
+      - name: Publish security summary
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          if [ -f results/comparison.md ]; then
+            cat results/comparison.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "# 🛡️ Container Security Pipeline"
+              echo
+              echo "## ❌ Pipeline result: FAIL"
+              echo
+              echo "The final security report could not be generated."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Store final security evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: security-evidence-${{ github.sha }}
+          path: results/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Commit automated hardening
+        id: hardening_commit
+        if: >-
+          ${{
+            steps.gate_evaluation.outcome == 'success' &&
+            needs.baseline.outputs.remediation_required == 'true' &&
+            github.event.pull_request.head.repo.full_name == github.repository
+          }}
+        shell: bash
+        run: |
+          git add \
+            app/Dockerfile \
+            app/requirements.txt \
+            docker-compose.yml
+
+          if git diff --cached --quiet; then
+            echo "No hardening changes required."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git commit \
+            -m "chore(security): apply automated container hardening"
+
+          git push origin \
+            "HEAD:${{ github.head_ref }}"
+
+      - name: Resolve validated commit
+        id: validated_commit
+        if: ${{ always() }}
+        shell: bash
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if git rev-parse --is-inside-work-tree > /dev/null 2>&1; then
+            sha="$(git rev-parse HEAD)"
+          else
+            sha="${PR_HEAD_SHA}"
+          fi
+
+          echo "Validated SHA: ${sha}"
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish gate status
+        if: >-
+          ${{
+            always() &&
+            steps.validated_commit.outputs.sha != ''
+          }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VALIDATED_SHA: ${{ steps.validated_commit.outputs.sha }}
+          PIPELINE_STATE: ${{ steps.pipeline_state.outcome }}
+          GATE_RESULT: ${{ steps.gate_evaluation.outcome }}
+          HARDENING_COMMIT: ${{ steps.hardening_commit.outcome }}
+        run: |
+          state="failure"
+          description="Container security pipeline failed"
+
+          if \
+            [ "${PIPELINE_STATE}" = "success" ] &&
+            [ "${GATE_RESULT}" = "success" ] &&
+            [ "${HARDENING_COMMIT}" != "failure" ]
+          then
+            state="success"
+            description="Container security policy validated"
+          fi
+
+          gh api \
+            --method POST \
+            "repos/${GITHUB_REPOSITORY}/statuses/${VALIDATED_SHA}" \
+            -f state="${state}" \
+            -f context="container-security/gate" \
+            -f description="${description}" \
+            -f target_url="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          echo "Published ${state} status for ${VALIDATED_SHA}"
