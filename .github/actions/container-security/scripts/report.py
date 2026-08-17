@@ -244,8 +244,8 @@ def parse_dclint(variant):
 
     text = path.read_text()
 
-    # DCLint prints nothing when there are no findings.
-    if not text.strip():
+    # Explicit clean result produced by the pipeline.
+    if "DCLINT_RESULT=PASS" in text:
         return {
             "available": True,
             "problems": 0,
@@ -253,6 +253,7 @@ def parse_dclint(variant):
             "warnings": 0,
         }
 
+    # When findings exist, DCLint prints its normal summary.
     match = re.search(
         r"(\d+)\s+problems?\s+"
         r"\((\d+)\s+errors?,\s+"
@@ -260,19 +261,21 @@ def parse_dclint(variant):
         text,
     )
 
-    if not match:
+    if match:
         return {
-            "available": False,
-            "problems": None,
-            "errors": None,
-            "warnings": None,
+            "available": True,
+            "problems": int(match.group(1)),
+            "errors": int(match.group(2)),
+            "warnings": int(match.group(3)),
         }
 
+    # FAIL without a parsable DCLint report means the tool itself
+    # did not complete correctly. Fail closed.
     return {
-        "available": True,
-        "problems": int(match.group(1)),
-        "errors": int(match.group(2)),
-        "warnings": int(match.group(3)),
+        "available": False,
+        "problems": None,
+        "errors": None,
+        "warnings": None,
     }
 
 

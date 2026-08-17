@@ -108,11 +108,25 @@ runs:
       if: ${{ inputs.phase == 'baseline' }}
       shell: bash
       run: |
+        set +e
+
         docker run --rm \
           -v "$GITHUB_WORKSPACE:/app" \
           zavoloklom/dclint:3.1.0 \
           /app/docker-compose.yml \
-          > results/baseline/dclint.txt 2>&1 || true
+          > results/baseline/dclint.txt 2>&1
+
+        exit_code=$?
+
+        set -e
+
+        if [ "$exit_code" -eq 0 ]; then
+          echo "DCLINT_RESULT=PASS" >> results/baseline/dclint.txt
+        else
+          echo "DCLINT_RESULT=FAIL" >> results/baseline/dclint.txt
+        fi
+
+        echo "DCLint baseline exit code: $exit_code"
 
     - name: Start baseline environment
       if: ${{ inputs.phase == 'baseline' }}
@@ -217,11 +231,25 @@ runs:
       if: ${{ inputs.phase == 'hardened' }}
       shell: bash
       run: |
+        set +e
+
         docker run --rm \
           -v "$GITHUB_WORKSPACE:/app" \
           zavoloklom/dclint:3.1.0 \
           /app/docker-compose.yml \
-          > results/hardened/dclint.txt 2>&1 || true
+          > results/hardened/dclint.txt 2>&1
+
+        exit_code=$?
+
+        set -e
+
+        if [ "$exit_code" -eq 0 ]; then
+          echo "DCLINT_RESULT=PASS" >> results/hardened/dclint.txt
+        else
+          echo "DCLINT_RESULT=FAIL" >> results/hardened/dclint.txt
+        fi
+
+        echo "DCLint hardened exit code: $exit_code"
 
     - name: Start hardened environment
       if: ${{ inputs.phase == 'hardened' }}
