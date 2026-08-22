@@ -39,6 +39,16 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Define release version
+        shell: bash
+        run: |
+          VERSION="v0.1.${GITHUB_RUN_NUMBER}"
+
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+
+          echo "Release version: ${VERSION}"
+          echo "Commit: ${GITHUB_SHA}"
+
       - name: Validate merged application
         id: audit
         uses: Alexander-FB/tfm-alexander-security-pipeline/.github/actions/container-security@main
@@ -73,14 +83,6 @@ jobs:
         with:
           phase: report
 
-      - name: Store GitHub release evidence
-        uses: actions/upload-artifact@v7
-        with:
-          name: release-security-evidence-${{ github.sha }}
-          path: results/
-          if-no-files-found: error
-          retention-days: 30
-
       - name: Configure AWS credentials through OIDC
         uses: aws-actions/configure-aws-credentials@v6.2.3
         with:
@@ -96,29 +98,63 @@ jobs:
         env:
           ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
           ECR_REPOSITORY: ${{ inputs.ecr_repository }}
+          AWS_REGION: ${{ inputs.aws_region }}
         run: |
-          IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}:${GITHUB_SHA}"
+          IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}:${VERSION}"
 
-          echo "Publishing validated image:"
-          echo "${IMAGE_URI}"
+          echo "Release version: ${VERSION}"
+          echo "Image: ${IMAGE_URI}"
 
-          docker tag \
-            tfm-api:baseline \
-            "${IMAGE_URI}"
+          if aws ecr describe-images \
+            --region "${AWS_REGION}" \
+            --repository-name "${ECR_REPOSITORY}" \
+            --image-ids imageTag="${VERSION}" \
+            > /dev/null 2>&1
+          then
+            echo "Image ${VERSION} already exists in ECR."
+            echo "This appears to be a workflow re-run; skipping duplicate push."
+          else
+            docker tag \
+              tfm-api:baseline \
+              "${IMAGE_URI}"
 
-          docker push \
-            "${IMAGE_URI}"
+            docker push \
+              "${IMAGE_URI}"
+          fi
 
           echo "IMAGE_URI=${IMAGE_URI}" >> "$GITHUB_ENV"
+
+      - name: Create release metadata
+        shell: bash
+        run: |
+          cat > results/release-metadata.json <<JSON
+          {
+            "version": "${VERSION}",
+            "commit": "${GITHUB_SHA}",
+            "repository": "${GITHUB_REPOSITORY}",
+            "image": "${IMAGE_URI}"
+          }
+          JSON
+
+          echo "Release metadata:"
+          cat results/release-metadata.json
+
+      - name: Store GitHub release evidence
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-security-evidence-${{ github.run_number }}
+          path: results/
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Publish security evidence to S3
         shell: bash
         env:
           S3_BUCKET: ${{ inputs.s3_bucket }}
         run: |
-          DESTINATION="s3://${S3_BUCKET}/${GITHUB_SHA}/"
+          DESTINATION="s3://${S3_BUCKET}/releases/${VERSION}/"
 
-          echo "Publishing release evidence:"
+          echo "Publishing security evidence:"
           echo "${DESTINATION}"
 
           aws s3 cp \
@@ -135,12 +171,12 @@ jobs:
           {
             echo "# 🚀 Container release"
             echo
-            echo "✅ Merged commit validated successfully."
+            echo "## ✅ Release ${VERSION}"
             echo
             echo "| Artifact | Destination |"
             echo "|---|---|"
+            echo "| Version | \`${VERSION}\` |"
             echo "| Container image | \`${IMAGE_URI}\` |"
-            echo "| Security evidence | \`s3://${S3_BUCKET}/${GITHUB_SHA}/\` |"
-            echo
-            echo "**Commit:** \`${GITHUB_SHA}\`"
+            echo "| Security evidence | \`s3://${S3_BUCKET}/releases/${VERSION}/\` |"
+            echo "| Git commit | \`${GITHUB_SHA}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
